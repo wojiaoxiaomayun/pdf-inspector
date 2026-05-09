@@ -285,7 +285,11 @@ pub fn detect_tables_from_rects(
         //
         // Only remove when the container is a similarly-sized cell (height
         // ratio < 4×), NOT when the container is a table-wide background
-        // that dwarfs the sub-rect.
+        // that dwarfs the sub-rect.  Origin-anchored page-background rects
+        // also disqualify as containers — they normally exceed the 4× ratio,
+        // but when the sub-rect is itself a tall table-frame the ratio can
+        // fall under the gate, and dropping the frame collapses cluster
+        // adjacency between adjacent column-cell groups.
         //
         // Skip this O(n²) dedup when there are too many rects — pages with
         // thousands of vector-drawing rects won't benefit from cell dedup.
@@ -295,9 +299,11 @@ pub fn detect_tables_from_rects(
             page_rects.retain(|&(ax, ay, aw, ah)| {
                 let tol = 2.0;
                 !snapshot.iter().any(|&(bx, by, bw, bh)| {
+                    let container_is_page_bg = bx < 5.0 && by < 5.0;
                     // b must strictly contain a (b is larger in area)
                     bw * bh > aw * ah * 1.2
                         && bh < ah * 4.0 // container must be similarly sized, not a table background
+                        && !container_is_page_bg
                         && bx <= ax + tol
                         && (bx + bw) >= (ax + aw) - tol
                         && by <= ay + tol
@@ -1626,17 +1632,17 @@ fn detect_row_stripe_table_from_cell_rects(
         }
     };
 
-    let col_edges = match (rect_col_edges, text_col_edges) {
+    let (col_edges, columns_from_text) = match (rect_col_edges, text_col_edges) {
         (Some(rect_edges), Some(text_edges)) if rect_edges.len() <= text_edges.len() => {
             debug!(
                 "  cell-rect using {} rect-derived columns over {} text clusters",
                 rect_edges.len() - 1,
                 text_edges.len() - 1
             );
-            rect_edges
+            (rect_edges, false)
         }
-        (_, Some(text_edges)) => text_edges,
-        (Some(rect_edges), None) => rect_edges,
+        (_, Some(text_edges)) => (text_edges, true),
+        (Some(rect_edges), None) => (rect_edges, false),
         (None, None) => {
             debug!(
                 "  cell-rect rejected: only {} columns from text clustering",
@@ -1661,10 +1667,23 @@ fn detect_row_stripe_table_from_cell_rects(
         page_items.len()
     );
 
-    let (cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
+    let (mut cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
 
     if item_indices.is_empty() {
         return None;
+    }
+
+    let mut row_edges = row_edges;
+    let (collapsed_cells, collapsed_row_edges, collapsed_rows) =
+        collapse_multiline_description_rows(cells, row_edges, &col_edges);
+    let has_wrapped_description_rows = collapsed_rows > 0;
+    cells = collapsed_cells;
+    row_edges = collapsed_row_edges;
+    if collapsed_rows > 0 {
+        debug!(
+            "  cell-rect collapsed {} wrapped description rows",
+            collapsed_rows
+        );
     }
 
     // Validate: >=2 non-empty rows, >=25% density
@@ -1680,6 +1699,7 @@ fn detect_row_stripe_table_from_cell_rects(
         return None;
     }
 
+    let num_rows = cells.len();
     let total_cells = (num_cols * num_rows) as f32;
     let non_empty_cells = cells
         .iter()
@@ -1725,13 +1745,36 @@ fn detect_row_stripe_table_from_cell_rects(
 
     // Reject "tables" that are actually prose in a framed region.
     // Columns here come from text X-position clustering; when prose wraps
-    // inside a bounding-box rect (e.g. chat-transcript figures) the
-    // word-boundary gaps cluster into many spurious columns, and the
-    // resulting cells hold sentence fragments riddled with common English
-    // function words. Count cells with any such word and reject when
-    // 20%+ of non-empty cells match — real tabular data (labels, units,
-    // numbers) rarely contains these words.
-    if num_cols >= 4 {
+    // inside a bounding-box rect (e.g. chat-transcript figures, two-column
+    // legal-text blocks in forms) the word-boundary gaps cluster into
+    // spurious columns, and the resulting cells hold sentence fragments
+    // riddled with common English function words.
+    //
+    // Apply at any column count >= 2. The 2-col case is the bite — a
+    // paragraph wrapped into 2 justified columns produces the same
+    // surface signal as a real "label / value" table in the
+    // well-distributed-cols check (both cols populated), so we need a
+    // content-based signal to tell them apart.
+    //
+    // Layered checks combine after the 20%-of-cells prose-word
+    // trigger fires:
+    //   (a) Long-cell content: prose-in-a-frame averages ~70-100 chars
+    //       per non-empty cell (sentence fragments); real data tables
+    //       are typically <30 chars, occasionally up to ~55 for
+    //       descriptive 4-col tables. The 65-char threshold cleanly
+    //       separates them on observed fixtures (accessory_building
+    //       prose=74 chars, upstage data=53, greencomp=20). This
+    //       overrides the well-distributed relaxation — long cells
+    //       are the strongest prose signal even when both cols are
+    //       populated.
+    //   (b) Two-column text-only scaffold: when both columns were inferred
+    //       from text starts rather than rect edges, prose fragments can look
+    //       perfectly balanced. Require rect evidence for this relaxed shape.
+    //   (c) Well-distributed columns: ≥75% of cols hold ≥2 non-empty
+    //       cells. Catches the prose-paragraph-as-many-cols shape
+    //       while admitting real "label / value / description /
+    //       benefit"-style tables.
+    if num_cols >= 2 {
         const PROSE_WORDS: &[&str] = &[
             "a", "an", "the", "of", "to", "is", "was", "are", "were", "be", "been", "in", "on",
             "at", "with", "for", "by", "as", "and", "or", "but", "this", "that", "these", "those",
@@ -1741,6 +1784,7 @@ fn detect_row_stripe_table_from_cell_rects(
         ];
         let mut prose_cells = 0usize;
         let mut counted = 0usize;
+        let mut total_chars = 0usize;
         for row in &cells {
             for cell in row {
                 let t = cell.trim();
@@ -1748,6 +1792,7 @@ fn detect_row_stripe_table_from_cell_rects(
                     continue;
                 }
                 counted += 1;
+                total_chars += t.chars().count();
                 let lower = t.to_ascii_lowercase();
                 let has_prose_word = lower
                     .split(|c: char| !c.is_ascii_alphabetic() && c != '\'')
@@ -1758,11 +1803,65 @@ fn detect_row_stripe_table_from_cell_rects(
             }
         }
         if counted > 0 && prose_cells * 5 >= counted {
+            // (a) Long-cell content: overrides the well-distributed
+            // relaxation. The 2-col prose-in-a-frame case populates
+            // both cols (passes well-distributed) but every cell
+            // holds a sentence fragment, so mean cell length is the
+            // discriminator.
+            const PROSE_MEAN_CHAR_THRESHOLD: usize = 65;
+            let mean_chars = total_chars / counted;
+            if mean_chars > PROSE_MEAN_CHAR_THRESHOLD && !has_wrapped_description_rows {
+                debug!(
+                    "  cell-rect rejected: prose-in-frame, mean non-empty cell {} chars > {} (prose words {}/{})",
+                    mean_chars, PROSE_MEAN_CHAR_THRESHOLD, prose_cells, counted
+                );
+                return None;
+            } else if mean_chars > PROSE_MEAN_CHAR_THRESHOLD {
+                debug!(
+                    "  cell-rect prose check relaxed: wrapped description rows, mean {} chars (prose words {}/{})",
+                    mean_chars, prose_cells, counted
+                );
+            }
+
+            // (b) Two text-derived columns are not enough vector evidence once
+            // the content looks prose-like. Real 2-col rect tables still pass
+            // when the column scaffold comes from drawn cell geometry.
+            if columns_from_text && num_cols == 2 {
+                debug!(
+                    "  cell-rect rejected: prose-in-frame with text-derived 2-col scaffold (mean {} chars, prose words {}/{})",
+                    mean_chars, prose_cells, counted
+                );
+                return None;
+            }
+
+            // (c) Well-distributed columns.
+            let filled_cols = (0..num_cols)
+                .filter(|&c| {
+                    cells
+                        .iter()
+                        .filter(|row| {
+                            !row.get(c)
+                                .map(String::as_str)
+                                .unwrap_or("")
+                                .trim()
+                                .is_empty()
+                        })
+                        .count()
+                        >= 2
+                })
+                .count();
+            let well_distributed = filled_cols * 4 >= num_cols * 3;
+            if !well_distributed {
+                debug!(
+                    "  cell-rect rejected: {}/{} cells contain prose function words — likely prose ({}/{} cols filled, mean {} chars)",
+                    prose_cells, counted, filled_cols, num_cols, mean_chars
+                );
+                return None;
+            }
             debug!(
-                "  cell-rect rejected: {}/{} cells contain prose function words — likely prose",
-                prose_cells, counted
+                "  cell-rect prose check relaxed: {}/{} cols filled, mean {} chars — table-with-description-col",
+                filled_cols, num_cols, mean_chars
             );
-            return None;
         }
     }
 
@@ -1781,6 +1880,132 @@ fn detect_row_stripe_table_from_cell_rects(
     );
 
     Some(Table::new(column_centers, row_centers, cells, item_indices))
+}
+
+/// Merge wrapped description-line bands back into their visual data rows.
+///
+/// Some Word/PDF exports draw enough rectangle geometry to prove a table exists
+/// but expose Y bands per wrapped text line instead of per cell row. In the
+/// common mapping-table shape, a narrow row-label column precedes one wide
+/// description column, and wrapped continuation bands have content only in that
+/// wide column. Merge only that high-confidence shape so framed prose still
+/// falls through the existing prose guards.
+fn collapse_multiline_description_rows(
+    cells: Vec<Vec<String>>,
+    row_edges: Vec<f32>,
+    col_edges: &[f32],
+) -> (Vec<Vec<String>>, Vec<f32>, usize) {
+    let num_rows = cells.len();
+    let num_cols = col_edges.len().saturating_sub(1);
+    if num_rows < 3 || num_cols < 3 || row_edges.len() != num_rows + 1 {
+        return (cells, row_edges, 0);
+    }
+
+    let table_width = col_edges[num_cols] - col_edges[0];
+    if table_width <= 0.0 {
+        return (cells, row_edges, 0);
+    }
+
+    let Some((description_col, description_width)) = (0..num_cols)
+        .map(|c| (c, col_edges[c + 1] - col_edges[c]))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+    else {
+        return (cells, row_edges, 0);
+    };
+
+    // Require a preceding row-label column. Without it (e.g. a prose frame
+    // split into text-start columns), "one populated wide column" is not enough
+    // evidence to find visual row starts safely.
+    if description_col == 0 || description_width < table_width * 0.35 {
+        return (cells, row_edges, 0);
+    }
+
+    let row_has_left_label = |row: &[String]| {
+        row.iter()
+            .take(description_col)
+            .any(|cell| !cell.trim().is_empty())
+    };
+    let labeled_rows = cells.iter().filter(|row| row_has_left_label(row)).count();
+    if labeled_rows < 2 {
+        return (cells, row_edges, 0);
+    }
+
+    let mut merged_rows = 0usize;
+    let mut wrapped_description_rows = 0usize;
+    let mut new_cells: Vec<Vec<String>> = Vec::with_capacity(num_rows);
+    let mut new_edges = Vec::with_capacity(row_edges.len());
+    new_edges.push(row_edges[0]);
+
+    for (row_idx, row) in cells.into_iter().enumerate() {
+        let desc_text = row
+            .get(description_col)
+            .map(String::as_str)
+            .unwrap_or("")
+            .trim();
+        let left_label = row_has_left_label(&row);
+        let non_desc_non_empty = row
+            .iter()
+            .enumerate()
+            .filter(|(col, cell)| *col != description_col && !cell.trim().is_empty())
+            .count();
+
+        // Wrapped continuation bands contain only description-column text.
+        // The preceding label/marker column is empty because the visual row's
+        // label cell spans the whole wrapped block.
+        let is_description_continuation = row_idx > 0
+            && !desc_text.is_empty()
+            && !left_label
+            && non_desc_non_empty == 0
+            && !new_cells.is_empty();
+
+        // Header cells are often split as "Controls" / "Version" in the first
+        // column while the other header labels sit on the first band.
+        let only_first_col = row
+            .iter()
+            .enumerate()
+            .all(|(col, cell)| col == 0 || cell.trim().is_empty());
+        let is_header_continuation = row_idx > 0
+            && only_first_col
+            && row
+                .first()
+                .is_some_and(|cell| !cell.trim().is_empty() && cell.chars().count() <= 24)
+            && !new_cells.is_empty()
+            && new_cells
+                .last()
+                .is_some_and(|prev| prev.iter().filter(|c| !c.trim().is_empty()).count() >= 2);
+
+        if is_description_continuation || is_header_continuation {
+            if let Some(prev) = new_cells.last_mut() {
+                for (col, cell) in row.iter().enumerate() {
+                    let text = cell.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if !prev[col].trim().is_empty() {
+                        prev[col].push(' ');
+                    }
+                    prev[col].push_str(text);
+                }
+            }
+            merged_rows += 1;
+            if is_description_continuation {
+                wrapped_description_rows += 1;
+            }
+        } else {
+            if !new_cells.is_empty() {
+                new_edges.push(row_edges[row_idx]);
+            }
+            new_cells.push(row);
+        }
+    }
+
+    new_edges.push(*row_edges.last().unwrap());
+
+    if merged_rows == 0 || new_cells.len() < 2 || new_edges.len() != new_cells.len() + 1 {
+        return (new_cells, row_edges, 0);
+    }
+
+    (new_cells, new_edges, wrapped_description_rows)
 }
 
 /// Detect a table by merging all cluster rects into one group.
@@ -2971,6 +3196,150 @@ mod tests {
             assert!(!hints[0].cluster_rects.is_empty());
         }
         // If tables were detected, that's also acceptable
+    }
+
+    #[test]
+    fn text_derived_two_col_prose_is_not_cell_rect_table() {
+        let page = 1;
+        let mut rects = Vec::new();
+        for row in 0..8 {
+            rects.push(PdfRect {
+                x: 50.0,
+                y: 100.0 + row as f32 * 20.0,
+                width: 180.0,
+                height: 18.0,
+                page,
+            });
+        }
+
+        let mut items = Vec::new();
+        let left = [
+            "the annual plan was revised",
+            "and the team noted changes",
+            "this section explains limits",
+            "with additional notes below",
+            "the policy was reviewed",
+            "and results are summarized",
+            "this appendix describes scope",
+            "with examples for reference",
+        ];
+        let right = [
+            "for each area in the review",
+            "as part of the assessment",
+            "that were applied in context",
+            "to support the conclusion",
+            "for use by the committee",
+            "as shown in the narrative",
+            "that remain under discussion",
+            "to clarify the method",
+        ];
+        for row in 0..8 {
+            let y = 104.0 + row as f32 * 20.0;
+            let mut left_item = make_item(left[row], 60.0, y, 9.0);
+            left_item.width = 50.0;
+            items.push(left_item);
+            let mut right_item = make_item(right[row], 150.0, y, 9.0);
+            right_item.width = 50.0;
+            items.push(right_item);
+        }
+
+        let (tables, _hints) = detect_tables_from_rects(&items, &rects, page);
+        assert!(
+            tables.is_empty(),
+            "text-derived two-column prose must not be accepted as a rect table; got {:?}",
+            tables
+                .iter()
+                .map(|t| (t.rows.len(), t.columns.len()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn multiline_indented_description_rows_collapse_to_visual_rows() {
+        let page = 1;
+        let col_edges = [0.0, 60.0, 420.0, 460.0, 500.0, 540.0];
+        let row_edges = [
+            340.0, 320.0, 300.0, 270.0, 250.0, 230.0, 200.0, 180.0, 160.0,
+        ];
+
+        let mut rects = Vec::new();
+        for row in 0..row_edges.len() - 1 {
+            let y_top = row_edges[row];
+            let y_bot = row_edges[row + 1];
+            for col in 0..col_edges.len() - 1 {
+                rects.push((
+                    col_edges[col],
+                    y_bot,
+                    col_edges[col + 1] - col_edges[col],
+                    y_top - y_bot,
+                ));
+            }
+        }
+
+        let mut items = vec![
+            make_item("Controls", 8.0, 330.0, 9.0),
+            make_item("Control", 70.0, 330.0, 9.0),
+            make_item("IG 1", 428.0, 330.0, 9.0),
+            make_item("IG 2", 468.0, 330.0, 9.0),
+            make_item("IG 3", 508.0, 330.0, 9.0),
+            make_item("Version", 8.0, 310.0, 9.0),
+            make_item("v8", 20.0, 285.0, 9.0),
+            make_item(
+                "4.5 Implement and Manage a Firewall on End-User Devices",
+                70.0,
+                285.0,
+                9.0,
+            ),
+            make_item("*", 438.0, 285.0, 9.0),
+            make_item("*", 478.0, 285.0, 9.0),
+            make_item("*", 518.0, 285.0, 9.0),
+            make_item("v7", 20.0, 215.0, 9.0),
+            make_item(
+                "9.4 Apply Host-based Firewalls or Port-Filtering",
+                70.0,
+                215.0,
+                9.0,
+            ),
+            make_item("*", 478.0, 215.0, 9.0),
+            make_item("*", 518.0, 215.0, 9.0),
+        ];
+        items.push(make_item(
+            "Implement and manage a host-based firewall or port-filtering tool",
+            84.0,
+            260.0,
+            8.0,
+        ));
+        items.push(make_item(
+            "on end-user devices with a default-deny rule",
+            84.0,
+            240.0,
+            8.0,
+        ));
+        items.push(make_item(
+            "Apply host-based firewalls or port filtering tools on end systems",
+            84.0,
+            190.0,
+            8.0,
+        ));
+        items.push(make_item(
+            "and deny unauthorized network communication",
+            84.0,
+            170.0,
+            8.0,
+        ));
+
+        let table = detect_row_stripe_table_from_cell_rects(&items, &rects, page)
+            .expect("expected multiline description table");
+        assert_eq!(table.columns.len(), 5);
+        assert_eq!(
+            table.rows.len(),
+            3,
+            "wrapped lines should collapse to header plus two data rows"
+        );
+        assert_eq!(table.cells[0][0], "Controls Version");
+        assert!(table.cells[1][1].contains("host-based firewall"));
+        assert!(table.cells[1][1].contains("default-deny rule"));
+        assert!(table.cells[2][1].contains("deny unauthorized"));
     }
 
     #[test]

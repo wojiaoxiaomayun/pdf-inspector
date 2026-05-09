@@ -1051,6 +1051,251 @@ mod vector_grid_tests {
         );
     }
 
+    /// Helper: load a fixture PDF and run the rect-based table detector.
+    fn detect_rect_tables_in_fixture_page(path: &str, page_num: u32) -> Vec<crate::tables::Table> {
+        use crate::extractor::content_stream::extract_page_text_items;
+        use crate::tables::detect_tables_from_rects;
+        use crate::tounicode::FontCMaps;
+        use lopdf::Document;
+        use std::collections::HashSet;
+        use std::fs;
+
+        let buf = fs::read(path).unwrap();
+        let doc = Document::load_mem(&buf).unwrap();
+        let pages = doc.get_pages();
+        let &page_id = pages.get(&page_num).unwrap();
+        let needed: HashSet<u32> = HashSet::from([page_num]);
+        let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
+        let ((items, rects, _lines), _images, _has_gid, _rotated) =
+            extract_page_text_items(&doc, page_id, page_num, &cmaps, false).unwrap();
+
+        let (rect_tables, _) = detect_tables_from_rects(&items, &rects, page_num);
+        rect_tables
+    }
+
+    fn detect_rect_tables_in_fixture(path: &str) -> Vec<crate::tables::Table> {
+        detect_rect_tables_in_fixture_page(path, 1)
+    }
+
+    /// Regression for the prose-in-a-frame failure mode introduced by the
+    /// shaded-header detection lift (PR #76). The accessory_building permit
+    /// form has a paragraph of legal text laid out in a 2-column justified
+    /// block; the new fill-priority + dedup changes start producing rects
+    /// for it, and the rect detector then admits a 10×2 fake table where
+    /// every cell holds a sentence fragment ("I agree to comply...", "I",
+    /// "It is the property owner's responsibility..."). This test asserts
+    /// the detector REJECTS that fake table — only the real 5×3 form data
+    /// table (TYPE / SIZE / SETBACKS) should survive. See pdf-evals PR #30
+    /// for the original score regression that surfaced this.
+    #[test]
+    fn accessory_building_rejects_prose_in_frame() {
+        let tables = detect_rect_tables_in_fixture(
+            "tests/fixtures/accessory_building_permit_prose_frame.pdf",
+        );
+        // Real form data table (TYPE / SIZE / SETBACKS) must still be detected.
+        let data_table = tables.iter().find(|t| t.columns.len() == 3);
+        assert!(
+            data_table.is_some(),
+            "expected to keep the 5×3 TYPE/SIZE/SETBACKS data table; got {:?}",
+            tables
+                .iter()
+                .map(|t| (t.rows.len(), t.columns.len()))
+                .collect::<Vec<_>>()
+        );
+        // Prose paragraph laid out in 2 cols must NOT be detected as a table.
+        // If the rejection regresses, the 10×2 fake table reappears and
+        // produces fragmented markdown like "I agree to comply..." | "I"
+        // that fragments mid-sentence.
+        let prose_table = tables.iter().find(|t| t.columns.len() == 2);
+        assert!(
+            prose_table.is_none(),
+            "expected the 10×2 prose-in-frame block to be rejected; got rows×cols = {:?}",
+            prose_table.map(|t| (t.rows.len(), t.columns.len()))
+        );
+    }
+
+    /// Wireless table regression: decorative/text-region rects may provide row
+    /// bands, but without a real rect-derived column scaffold they must not be
+    /// accepted as a vector grid.
+    #[test]
+    fn wireless_two_col_rejects_rect_grid() {
+        let tables = detect_rect_tables_in_fixture("tests/fixtures/wireless_two_col_no_rects.pdf");
+        assert!(
+            tables.is_empty(),
+            "expected no rect-detected tables for wireless content; got {:?}",
+            tables
+                .iter()
+                .map(|t| (t.rows.len(), t.columns.len()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn wireless_two_col_region_rejects_vector_grid() {
+        let buf = std::fs::read("tests/fixtures/wireless_two_col_no_rects.pdf").unwrap();
+        let crops = [
+            [49.32_f32, 52.92, 558.72, 214.2],
+            [49.32_f32, 288.72, 556.56, 378.0],
+            [51.48_f32, 478.44, 558.36, 567.36],
+        ];
+        for crop in crops {
+            let detected = crate::detect_vector_grid_in_region_mem(&buf, 0, crop, 200.0).unwrap();
+            assert!(
+                detected.is_none(),
+                "expected no vector grid for wireless crop {crop:?}; got {} cells",
+                detected.map(|grid| grid.cell_bboxes.len()).unwrap_or(0)
+            );
+        }
+    }
+
+    /// Wireless dense table regression: text-position columns alone are not
+    /// enough evidence for a rect-derived grid.
+    #[test]
+    fn wireless_dense_rejects_rect_grid() {
+        let tables = detect_rect_tables_in_fixture("tests/fixtures/wireless_dense_no_rects.pdf");
+        assert!(
+            tables.is_empty(),
+            "expected no rect-detected tables for wireless content; got {:?}",
+            tables
+                .iter()
+                .map(|t| (t.rows.len(), t.columns.len()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn wireless_dense_region_rejects_vector_grid() {
+        let buf = std::fs::read("tests/fixtures/wireless_dense_no_rects.pdf").unwrap();
+        let crops = [
+            [72.36_f32, 177.48, 243.72, 333.36],
+            [72.0_f32, 390.24, 286.92, 417.6],
+        ];
+        for crop in crops {
+            let detected = crate::detect_vector_grid_in_region_mem(&buf, 0, crop, 200.0).unwrap();
+            assert!(
+                detected.is_none(),
+                "expected no vector grid for wireless crop {crop:?}; got {} cells",
+                detected.map(|grid| grid.cell_bboxes.len()).unwrap_or(0)
+            );
+        }
+    }
+
+    #[test]
+    fn multiline_indent_cell_rect_grid_fixture_detects_table() {
+        let tables = detect_rect_tables_in_fixture_page(
+            "tests/fixtures/multiline_indent_cell_rect_grid.pdf",
+            30,
+        );
+        let table = tables
+            .iter()
+            .max_by_key(|t| t.rows.len() * t.columns.len())
+            .expect("expected a rect-detected table");
+        assert_eq!(
+            table.columns.len(),
+            5,
+            "expected the Controls Version / Control / IG table shape; got {:?}",
+            tables
+                .iter()
+                .map(|t| (t.rows.len(), t.columns.len()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            table.rows.len() >= 3,
+            "expected at least header plus data rows; got {}",
+            table.rows.len()
+        );
+    }
+
+    #[test]
+    fn multiline_indent_cell_rect_grid_region_detects_vector_grid() {
+        let buf = std::fs::read("tests/fixtures/multiline_indent_cell_rect_grid.pdf").unwrap();
+        let detected =
+            crate::detect_vector_grid_in_region_mem(&buf, 29, [0.0, 0.0, 612.0, 792.0], 200.0)
+                .unwrap()
+                .expect("expected vector grid for multiline indented description table");
+        let rows = detected
+            .structure_tokens
+            .iter()
+            .filter(|token| token.as_str() == "<tr>")
+            .count();
+        assert_eq!(detected.cell_bboxes.len() % rows, 0);
+        assert_eq!(detected.cell_bboxes.len() / rows, 5);
+        assert!(rows >= 3);
+        assert!(!detected.cell_bboxes.is_empty());
+    }
+
+    /// Regression for `greencomp_competence.pdf` — a 2-column "Area / Competence"
+    /// glossary with a green-shaded header row and plain (line-drawn) body cells.
+    /// Mirrors the production failure cohort #1 (Contractions glossary) and #6
+    /// (BIO 350 course header): a few colored header rects sit in a horizontal
+    /// strip while body rows are drawn with `m`/`l` operators, so the rect
+    /// cluster has only 2 Y-edges and `try_build_grid` rejects.
+    ///
+    /// IGNORED: lifting this shape required the exact-duplicate early-dedup
+    /// (PR #76 first iteration), which had broad collateral damage on
+    /// SEC 10-K TOCs and similar docs that draw rule-rects above + below
+    /// section dividers (production diff: 0001104659-25-093871 lost its
+    /// TOC structure, perf-graph data table, and qualifications matrix).
+    /// Re-enable once a more surgical lift exists in `try_build_grid` or
+    /// `snap_edges` that handles cell-border + inner-fill + text-bg rect
+    /// triplets without page-wide dedup.
+    #[test]
+    #[ignore]
+    fn greencomp_competence_two_cols() {
+        let tables = detect_rect_tables_in_fixture("tests/fixtures/greencomp_competence.pdf");
+        assert!(
+            !tables.is_empty(),
+            "expected at least one rect-detected table for shaded-header + plain-body shape"
+        );
+        let t = tables
+            .iter()
+            .max_by_key(|t| t.rows.len() * t.columns.len())
+            .unwrap();
+        assert_eq!(
+            t.columns.len(),
+            2,
+            "GreenComp competence is a 2-column table; got {}: {:?}",
+            t.columns.len(),
+            t.columns
+        );
+        assert!(
+            t.rows.len() >= 6,
+            "expected at least 6 rows of competences; got {}",
+            t.rows.len()
+        );
+    }
+
+    /// Regression for `upstage_key_functions.pdf` — a 4-column "Service Stage /
+    /// Function Name / Explanation / Expected Benefit" table with a blue-shaded
+    /// header band plus alternating row backgrounds. Mirrors production crops
+    /// #2 (Parameter / Value with alternating blue rows) and #7 (Spanish XML
+    /// schema with shaded header). Currently `pdf2md` returns zero markdown
+    /// table rows.
+    #[test]
+    fn upstage_key_functions_four_cols() {
+        let tables = detect_rect_tables_in_fixture("tests/fixtures/upstage_key_functions.pdf");
+        assert!(
+            !tables.is_empty(),
+            "expected at least one rect-detected table for shaded-header + alt-row shape"
+        );
+        let t = tables
+            .iter()
+            .max_by_key(|t| t.rows.len() * t.columns.len())
+            .unwrap();
+        assert_eq!(
+            t.columns.len(),
+            4,
+            "Service Flow is a 4-column table; got {}: {:?}",
+            t.columns.len(),
+            t.columns
+        );
+        assert!(
+            t.rows.len() >= 8,
+            "expected at least 8 visible body rows; got {}",
+            t.rows.len()
+        );
+    }
+
     #[test]
     fn test_crop_px_bbox_is_plausible_bounds() {
         let crop = [10.0, 20.0, 110.0, 220.0];
@@ -1572,26 +1817,32 @@ pub fn extract_tables_with_structure_cells_mem(
 
         normalize_cell_bands(&mut cells);
 
-        // Stage 1: exclusive per-item assignment. For each PDF text item,
-        // find the cell(s) whose (band-clamped) bbox satisfies the strict
-        // membership rule (`tsr_region_contains_item`: center inside OR
-        // >=60% overlap on both axes). If multiple cells qualify, assign
-        // the item to the cell whose center is geometrically closest. If
-        // exactly one qualifies, assign to that. If none, the item is an
-        // orphan and stage 2 below tries to recover it.
+        // Stage 1: exclusive per-token assignment. Each PDF text item is
+        // first split into whitespace-separated tokens with estimated x
+        // positions (see `split_item_into_token_subitems`). For each token
+        // we find the cell(s) whose (band-clamped) bbox satisfies the
+        // strict membership rule (`tsr_region_contains_item`: center
+        // inside OR >=60% overlap on both axes). If multiple cells
+        // qualify, the closest-center wins. Tokens that don't land in any
+        // cell are eligible for stage-2 orphan recovery.
         //
-        // The exclusivity (one item → one cell) prevents the cell-overlap
-        // bug where SLANet emits cells whose y-extents overlap between
-        // rows: under the previous "for each cell, gather items" approach,
-        // an item whose center fell in two cells' overlap got duplicated
-        // into both. Closest-center disambiguation routes it to the
-        // correct row.
-        let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let mut item_to_cell: std::collections::HashMap<usize, usize> =
-            std::collections::HashMap::new();
+        // Per-token (rather than per-item) routing is what prevents the
+        // dense-grid collapse bug: a row rendered as one wide Tj
+        // ("Marshall Islands 0.9 0.9 0.9") produces one TextItem whose
+        // CENTER lies in only one cell, so per-item routing parks the
+        // whole row in that single cell and leaves the rest of the row
+        // empty. Per-token routing distributes the words to whichever
+        // cells their (estimated) positions fall into. Single-token items
+        // collapse to a one-element token list and behave exactly as
+        // before.
+        //
+        // The token-level exclusivity (one token → one cell) still
+        // prevents the cell-overlap bug where SLANet emits cells whose
+        // y-extents overlap between rows. Closest-center disambiguation
+        // routes each token to the correct row.
 
         // Pre-compute each cell's bounds + center (in PDF-pt-flipped space)
-        // so we don't redo the work per item.
+        // so we don't redo the work per token.
         let cell_meta: Vec<Option<(RegionBounds, f32, f32)>> = cells
             .iter()
             .map(|cell| {
@@ -1606,44 +1857,53 @@ pub fn extract_tables_with_structure_cells_mem(
             })
             .collect();
 
-        for (item_idx, item) in items.iter().enumerate() {
-            let item_w = text_utils::effective_width(item);
-            let item_cx = item.x + item_w * 0.5;
-            let item_cy = item.y + item.height * 0.5;
-            let mut best: Option<(usize, f32)> = None;
-            for (cell_idx, meta) in cell_meta.iter().enumerate() {
-                let Some((bounds, ccx, ccy)) = meta else {
-                    continue;
-                };
-                if !tsr_region_contains_item(item, *bounds) {
-                    continue;
+        let mut per_cell_items: Vec<Vec<TextItem>> = vec![Vec::new(); cells.len()];
+        // Tokens of an item that did NOT land in any cell during stage 1.
+        // These are the orphan candidates handed to `tsr_assign_orphan_items`.
+        // Using token-grain orphan candidates (rather than the original wide
+        // item) lets stage 2 recover individual words that fell just outside
+        // their cell's clamped band, without re-attributing already-claimed
+        // tokens.
+        let mut orphan_token_subitems: Vec<TextItem> = Vec::new();
+
+        for item in items.iter() {
+            let token_subitems = split_item_into_token_subitems(item);
+            for token_item in token_subitems {
+                let token_w = text_utils::effective_width(&token_item);
+                let token_cx = token_item.x + token_w * 0.5;
+                let token_cy = token_item.y + token_item.height * 0.5;
+                let mut best: Option<(usize, f32)> = None;
+                for (cell_idx, meta) in cell_meta.iter().enumerate() {
+                    let Some((bounds, ccx, ccy)) = meta else {
+                        continue;
+                    };
+                    if !tsr_region_contains_item(&token_item, *bounds) {
+                        continue;
+                    }
+                    let dx = token_cx - ccx;
+                    let dy = token_cy - ccy;
+                    let dist_sq = dx * dx + dy * dy;
+                    if best.is_none_or(|(_, d)| dist_sq < d) {
+                        best = Some((cell_idx, dist_sq));
+                    }
                 }
-                let dx = item_cx - ccx;
-                let dy = item_cy - ccy;
-                let dist_sq = dx * dx + dy * dy;
-                if best.is_none_or(|(_, d)| dist_sq < d) {
-                    best = Some((cell_idx, dist_sq));
+                if let Some((ci, _)) = best {
+                    per_cell_items[ci].push(token_item);
+                } else {
+                    orphan_token_subitems.push(token_item);
                 }
-            }
-            if let Some((ci, _)) = best {
-                claimed.insert(item_idx);
-                item_to_cell.insert(item_idx, ci);
             }
         }
 
-        // Build per-cell text from the assigned items. Markdown cells must
+        // Build per-cell text from the assigned tokens. Markdown cells must
         // be one line — collapse line breaks from the line-grouping pass.
-        let mut per_cell_items: Vec<Vec<TextItem>> = vec![Vec::new(); cells.len()];
-        for (&item_idx, &cell_idx) in &item_to_cell {
-            per_cell_items[cell_idx].push(items[item_idx].clone());
-        }
         for (cell_idx, matched) in per_cell_items.into_iter().enumerate() {
             cells[cell_idx].text = collect_text_from_matched_items(matched, adaptive_threshold)
                 .replace(['\n', '\r'], " ");
         }
 
-        // Stage 2: orphan assignment — text items that didn't land in any
-        // cell during stage 1 get assigned to their nearest *empty* cell,
+        // Stage 2: orphan assignment — tokens that didn't land in any cell
+        // during stage 1 get assigned to their nearest *empty* cell,
         // clamped by a plausibility cap derived from cell geometry.
         //
         // This recovers two failure modes left by `normalize_cell_bands`:
@@ -1655,12 +1915,82 @@ pub fn extract_tables_with_structure_cells_mem(
         // Empty-cell-only is the safety net: a cell already filled by stage 1
         // is never overwritten or augmented, so the cell-bleed case PR #62
         // closed cannot regress.
-        tsr_assign_orphan_items(items, &mut cells, &claimed, page_h, coords);
+        tsr_assign_orphan_items(
+            &orphan_token_subitems,
+            &mut cells,
+            &std::collections::HashSet::new(),
+            page_h,
+            coords,
+        );
 
         results.push(cells);
     }
 
     Ok(results)
+}
+
+/// Split a `TextItem` into one virtual sub-item per whitespace-separated
+/// token, with each token's `x` / `width` estimated from the original item's
+/// effective width and the token's character offset.
+///
+/// PDFs often render an entire row's content as a single Tj — e.g.
+/// "Marshall Islands 0.9 0.9 0.9" — producing one wide TextItem whose
+/// center sits in only one of the model-emitted cells. Per-item routing
+/// then parks the whole row in that one cell. Splitting on whitespace
+/// gives each word its own approximate position so per-cell routing can
+/// distribute the words to whichever cells their estimated centers fall
+/// into.
+///
+/// The character-width estimate is `effective_width / char_count`.
+/// `effective_width` returns the explicit `item.width` when known and
+/// otherwise falls back to `char_count * font_size * 0.5`. Either way the
+/// estimate is uniform across the item — fine for routing, since we only
+/// need to know which cell each token's center lands in, not its exact
+/// position. Single-token items collapse to a one-element vector
+/// equivalent to the input item, making this a no-op for the common case.
+fn split_item_into_token_subitems(item: &TextItem) -> Vec<TextItem> {
+    let total_chars = item.text.chars().count();
+    if total_chars == 0 {
+        return Vec::new();
+    }
+    let item_w = text_utils::effective_width(item);
+    let char_w = item_w / total_chars as f32;
+
+    let mut tokens: Vec<TextItem> = Vec::new();
+    let mut current_token = String::new();
+    let mut current_start_idx: Option<usize> = None;
+
+    let push_token =
+        |tokens: &mut Vec<TextItem>, text: String, start_idx: usize, end_idx: usize| {
+            if text.is_empty() {
+                return;
+            }
+            let mut sub = item.clone();
+            sub.text = text;
+            sub.x = item.x + start_idx as f32 * char_w;
+            sub.width = (end_idx - start_idx) as f32 * char_w;
+            tokens.push(sub);
+        };
+
+    for (idx, ch) in item.text.chars().enumerate() {
+        if ch.is_whitespace() {
+            if let Some(start_idx) = current_start_idx.take() {
+                let text = std::mem::take(&mut current_token);
+                push_token(&mut tokens, text, start_idx, idx);
+            }
+        } else {
+            if current_start_idx.is_none() {
+                current_start_idx = Some(idx);
+            }
+            current_token.push(ch);
+        }
+    }
+    if let Some(start_idx) = current_start_idx {
+        let text = std::mem::take(&mut current_token);
+        push_token(&mut tokens, text, start_idx, total_chars);
+    }
+
+    tokens
 }
 
 /// Compute plausibility caps for the orphan-assignment pass. Returns
