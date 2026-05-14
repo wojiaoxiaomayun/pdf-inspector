@@ -1394,13 +1394,15 @@ fn detect_row_stripe_table(
         .max()
         .unwrap_or(0);
     // Allow longer cells for multi-column tables (descriptions in one column
-    // are common).  Single-column or 2-column "tables" with giant cells are
-    // almost always layout backgrounds.
+    // are common). Narrow grids with giant cells are usually layout
+    // backgrounds — but only when the row count is also small. A 4+-row
+    // key/value table with one descriptive column reads as a real table
+    // on every other gate, so don't reject it on cell length alone.
     let max_allowed = if num_cols >= 3 { 2000 } else { 500 };
-    if max_cell_len > max_allowed {
+    if max_cell_len > max_allowed && non_empty_rows < 4 {
         debug!(
-            "  row-stripe rejected: max cell length {} > {} (layout background)",
-            max_cell_len, max_allowed
+            "  row-stripe rejected: max cell length {} > {} (layout background, {} rows)",
+            max_cell_len, max_allowed, non_empty_rows
         );
         return None;
     }
@@ -1632,7 +1634,49 @@ fn detect_row_stripe_table_from_cell_rects(
         }
     };
 
+    // For wired-grid tables whose header text is centered/right-aligned but
+    // whose data is left-aligned, cluster_x_positions can drop the header-only
+    // x-cluster in its singleton-filter pass and merge adjacent data clusters
+    // when the gap is below threshold, losing a column. Rect borders are
+    // ground truth in that case — but only when each rect column actually
+    // holds text. Decorative or background rects (prose laid out in a frame,
+    // cell-fill rects with extra borders) can produce more rect-derived
+    // columns than the text supports; preferring rects there would split a
+    // logical column into spurious sub-columns.
+    let rect_cols_match_text = match (&rect_col_edges, &text_col_edges) {
+        (Some(rect_edges), _) if rect_edges.len() >= 4 => {
+            let num_rect_cols = rect_edges.len() - 1;
+            let mut col_item_counts = vec![0usize; num_rect_cols];
+            for (_, item) in &page_items {
+                let cx = item.x + item.width / 2.0;
+                for c in 0..num_rect_cols {
+                    if cx >= rect_edges[c] - 2.0 && cx <= rect_edges[c + 1] + 2.0 {
+                        col_item_counts[c] += 1;
+                        break;
+                    }
+                }
+            }
+            // Require every rect column to hold multiple text items. A rect
+            // column with no (or only one) item is decorative or the rect grid
+            // is detecting a spurious column the data does not need; in those
+            // cases the old text-cluster preference is the safer fallback.
+            col_item_counts.iter().all(|&n| n >= 2)
+        }
+        _ => false,
+    };
+
     let (col_edges, columns_from_text) = match (rect_col_edges, text_col_edges) {
+        (Some(rect_edges), text_edges_opt) if rect_cols_match_text => {
+            debug!(
+                "  cell-rect using {} rect-derived columns (text clusters: {}; rect cols well-distributed)",
+                rect_edges.len() - 1,
+                text_edges_opt
+                    .as_ref()
+                    .map(|e| (e.len() - 1) as i32)
+                    .unwrap_or(-1)
+            );
+            (rect_edges, false)
+        }
         (Some(rect_edges), Some(text_edges)) if rect_edges.len() <= text_edges.len() => {
             debug!(
                 "  cell-rect using {} rect-derived columns over {} text clusters",
@@ -1719,17 +1763,21 @@ fn detect_row_stripe_table_from_cell_rects(
         return None;
     }
 
-    // Reject tables with paragraph-length cells (layout backgrounds, not tables)
+    // Reject tables with paragraph-length cells — typically layout
+    // backgrounds (sidebars, banners) where a single big rectangle
+    // contains a wall of prose.  Spare multi-row key/value tables where
+    // the value column is a multi-bullet description: those pass every
+    // other gate and shouldn't get killed on cell length alone.
     let max_cell_len = cells
         .iter()
         .flat_map(|row| row.iter())
         .map(|c| c.len())
         .max()
         .unwrap_or(0);
-    if max_cell_len > 500 {
+    if max_cell_len > 500 && non_empty_rows < 4 {
         debug!(
-            "  cell-rect rejected: max cell length {} > 500",
-            max_cell_len
+            "  cell-rect rejected: max cell length {} > 500 ({} rows, layout background)",
+            max_cell_len, non_empty_rows
         );
         return None;
     }
@@ -2143,18 +2191,20 @@ fn detect_merged_cluster_table(
         return None;
     }
 
-    // Reject if any cell has excessive text — layout background rects produce
-    // "cells" containing paragraphs, not short data-table values.
+    // Reject if any cell has excessive text — layout background rects
+    // produce "cells" containing paragraphs, not short data-table values.
+    // Multi-row key/value tables can legitimately have one column of
+    // long descriptive text, so only reject narrow-row layouts here.
     let max_cell_len = cells
         .iter()
         .flat_map(|row| row.iter())
         .map(|c| c.len())
         .max()
         .unwrap_or(0);
-    if max_cell_len > 500 {
+    if max_cell_len > 500 && non_empty_rows < 4 {
         debug!(
-            "  merged-cluster rejected: max cell length {} > 500 (layout background)",
-            max_cell_len
+            "  merged-cluster rejected: max cell length {} > 500 ({} rows, layout background)",
+            max_cell_len, non_empty_rows
         );
         return None;
     }
@@ -2582,6 +2632,46 @@ mod tests {
             result.is_none(),
             "layout background rects should not be detected as a table"
         );
+    }
+
+    #[test]
+    fn test_row_stripe_accepts_multi_row_key_value_long_cells() {
+        // Multi-row 2-column key/value table where one value cell holds
+        // a paragraph (>500 chars).  The old `max_cell_len > 500` check
+        // rejected this shape as a "layout background"; with the
+        // multi-row guard, it should be accepted.
+        let mut rects = Vec::new();
+        let row_h = 25.0_f32;
+        let y_top = 700.0_f32;
+        for i in 0..8 {
+            let y = y_top - (i as f32) * row_h;
+            rects.push((40.0, y, 510.0, row_h));
+        }
+        let mut items = Vec::new();
+        for i in 0..8 {
+            let row_center_y = y_top - (i as f32) * row_h + row_h / 2.0;
+            // Left column: short label
+            items.push(make_item(&format!("Field {}", i), 45.0, row_center_y, 10.0));
+            // Right column: short value, except the last row which is a paragraph
+            let value = if i == 7 {
+                "X".repeat(800)
+            } else {
+                "value".to_string()
+            };
+            items.push(make_item(&value, 300.0, row_center_y, 10.0));
+        }
+        let result = detect_row_stripe_table(&items, &rects, 1);
+        assert!(
+            result.is_some(),
+            "multi-row key/value table with one long cell should be accepted"
+        );
+        let t = result.unwrap();
+        assert!(
+            t.cells.len() >= 4,
+            "expected ≥4 rows, got {}",
+            t.cells.len()
+        );
+        assert_eq!(t.cells[0].len(), 2, "expected 2 columns");
     }
 
     // --- propagate_merged_cells ---
@@ -3340,6 +3430,88 @@ mod tests {
         assert!(table.cells[1][1].contains("host-based firewall"));
         assert!(table.cells[1][1].contains("default-deny rule"));
         assert!(table.cells[2][1].contains("deny unauthorized"));
+    }
+
+    /// Wire-bordered 4-column table whose header text is centered/right-aligned
+    /// inside each cell while the data is left-aligned: cluster_x_positions
+    /// merges adjacent columns (data Item→EAN gap is below threshold) and
+    /// drops the header-only x-clusters in the filter pass, leaving only 3
+    /// text-derived columns. Rect borders are 4 columns of ground truth.
+    /// Before the fix the cell-rect path preferred text edges when they were
+    /// the smaller set — losing a column. After the fix, 3+ rect columns
+    /// always win.
+    #[test]
+    fn wired_header_data_misaligned_keeps_all_columns_from_rects() {
+        let page = 1;
+        // 4 cols: Item | EAN | Nombre | Cant
+        let col_xs = [380.0_f32, 410.0, 470.0, 660.0, 700.0];
+        // Header + 9 data rows at 15pt tall each (y descending).
+        let row_ys: Vec<f32> = (0..=10).map(|r| 400.0 - 15.0 * r as f32).collect();
+
+        let mut rects: Vec<(f32, f32, f32, f32)> = Vec::new();
+        for r in 0..10 {
+            let y_top = row_ys[r];
+            let y_bot = row_ys[r + 1];
+            for c in 0..4 {
+                rects.push((col_xs[c], y_bot, col_xs[c + 1] - col_xs[c], y_top - y_bot));
+            }
+        }
+
+        let mut items: Vec<TextItem> = Vec::new();
+        // Header row (y ≈ 392.5): headers sit further to the right than data
+        // because they are centered/right-aligned in the cells.
+        items.push(make_item("Item", 389.0, 392.5, 9.0));
+        items.push(make_item("EAN", 432.0, 392.5, 9.0));
+        items.push(make_item("Nombre", 552.0, 392.5, 9.0));
+        items.push(make_item("Cant", 672.0, 392.5, 9.0));
+
+        let names = [
+            "Arnes Frontal",
+            "Arnes Motor",
+            "Arnes Piso",
+            "Arnes Techo",
+            "Arnes Puerta",
+            "Arnes Tablero",
+            "Arnes Trasero",
+            "Arnes Lateral",
+            "Arnes Sensor",
+        ];
+        for r in 0..9 {
+            let y = 377.5 - 15.0 * r as f32;
+            items.push(make_item(&(r + 1).to_string(), 396.0, y, 9.0));
+            items.push(make_item("7701023403016", 410.0, y, 9.0));
+            items.push(make_item(names[r], 480.0, y, 9.0));
+            items.push(make_item("1", 680.0, y, 9.0));
+        }
+
+        let table = detect_row_stripe_table_from_cell_rects(&items, &rects, page)
+            .expect("wired 4-column table with header/data x-misalignment must detect");
+        assert_eq!(
+            table.columns.len(),
+            4,
+            "expected 4 columns from rect borders; cells: {:?}",
+            table.cells
+        );
+        for c in 0..4 {
+            let any_populated = table.cells.iter().any(|row| !row[c].trim().is_empty());
+            assert!(
+                any_populated,
+                "column {} empty across all rows; cells: {:?}",
+                c, table.cells
+            );
+        }
+        // Header row populated in all 4 cells.
+        let header = &table.cells[0];
+        assert_eq!(header[0].trim(), "Item");
+        assert_eq!(header[1].trim(), "EAN");
+        assert_eq!(header[2].trim(), "Nombre");
+        assert_eq!(header[3].trim(), "Cant");
+        // First data row: Item="1", EAN, name, count="1" — no Item↔EAN merge.
+        let data1 = &table.cells[1];
+        assert_eq!(data1[0].trim(), "1");
+        assert_eq!(data1[1].trim(), "7701023403016");
+        assert!(data1[2].trim().contains("Arnes"));
+        assert_eq!(data1[3].trim(), "1");
     }
 
     #[test]

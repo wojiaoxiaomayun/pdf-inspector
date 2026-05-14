@@ -660,6 +660,8 @@ pub fn extract_tables_in_regions_mem(
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
 
     let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
+    let mut rects_by_page: HashMap<u32, Vec<PdfRect>> = HashMap::new();
+    let mut lines_by_page: HashMap<u32, Vec<PdfLine>> = HashMap::new();
     let mut page_heights: HashMap<u32, f32> = HashMap::new();
     let mut gid_pages: HashSet<u32> = HashSet::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
@@ -672,7 +674,7 @@ pub fn extract_tables_in_regions_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        let ((mut items, _rects, _lines), _page_images, has_gid, coords_rotated) =
+        let ((mut items, rects, lines), _page_images, has_gid, coords_rotated) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -691,6 +693,8 @@ pub fn extract_tables_in_regions_mem(
             rotated_pages.insert(*page_num);
         }
         items_by_page.insert(*page_num, items);
+        rects_by_page.insert(*page_num, rects);
+        lines_by_page.insert(*page_num, lines);
     }
 
     let mut results = Vec::with_capacity(page_regions.len());
@@ -720,15 +724,13 @@ pub fn extract_tables_in_regions_mem(
             // content. This avoids rejecting clean tables just because an
             // unrelated decorative font on the same page is GID-encoded.
 
+            let bounds = region_bounds(rx1, ry1, rx2, ry2, page_h, coords);
             let matched: Vec<TextItem> = match items {
-                Some(items) => {
-                    let bounds = region_bounds(rx1, ry1, rx2, ry2, page_h, coords);
-                    items
-                        .iter()
-                        .filter(|item| region_overlaps_item(item, bounds))
-                        .cloned()
-                        .collect()
-                }
+                Some(items) => items
+                    .iter()
+                    .filter(|item| region_overlaps_item(item, bounds))
+                    .cloned()
+                    .collect(),
                 None => Vec::new(),
             };
 
@@ -752,42 +754,100 @@ pub fn extract_tables_in_regions_mem(
                     .unwrap_or(12.0)
             };
 
-            // Run heuristic table detection; skip_body_font = false since
-            // the layout model already identified this region as a table.
-            let detected = tables::detect_tables(&matched, base_font_size, false);
+            // Try rect-backed and line-backed vector-grid detectors first,
+            // then fall back to the heuristic text-only detector. Each
+            // candidate's markdown is quality-gated by the same
+            // needs_ocr checks the heuristic-only path used: if a vector
+            // detector produces a partial/garbled table, we ignore it and
+            // try the next path rather than degrade the output.
+            // needs_ocr fires on any of:
+            //   - garbage text (non-alphanumeric heavy)
+            //   - CID/Latin-1 mojibake
+            //   - encoding issues (U+FFFD, dollar-as-space)
+            //   - structural giveaways that the table is partial /
+            //     mis-detected (numeric "header", empty header cells,
+            //     duplicate header cells).
+            // skip_body_font = false / layout_assisted = true because the
+            // layout model already identified this region as a table.
+            let region_rects: Vec<PdfRect> = rects_by_page
+                .get(&page_1idx)
+                .map(|rs| {
+                    rs.iter()
+                        .filter(|r| region_overlaps_rect(r, bounds))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let region_lines: Vec<PdfLine> = lines_by_page
+                .get(&page_1idx)
+                .map(|ls| {
+                    ls.iter()
+                        .filter(|l| region_overlaps_line(l, bounds))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
 
-            if let Some(table) = detected.into_iter().next() {
-                let md = tables::table_to_markdown(&table);
-                if md.trim().is_empty() {
-                    page_results.push(RegionText {
-                        text: String::new(),
-                        needs_ocr: true,
-                    });
-                } else {
-                    // needs_ocr fires on any of:
-                    //   - garbage text (non-alphanumeric heavy)
-                    //   - CID/Latin-1 mojibake
-                    //   - encoding issues (U+FFFD, dollar-as-space)
-                    //   - structural giveaways that the table is partial /
-                    //     mis-detected (numeric "header", empty header cells,
-                    //     duplicate header cells). Caught GLM-OCR-as-baseline
-                    //     scoring 0 TEDS on real prod tables in eval.
-                    // Layout model already identified this region as a table,
-                    // so use relaxed partial-table checks (layout_assisted=true).
-                    let needs_ocr = is_garbage_text(&md)
-                        || is_cid_garbage(&md)
-                        || detect_encoding_issues(&md)
-                        || looks_like_partial_table_ex(&md, true);
-                    page_results.push(RegionText {
-                        text: if needs_ocr { String::new() } else { md },
-                        needs_ocr,
-                    });
+            // Total length of text the page extractor saw inside this
+            // region, used by the captured-fragment guard below.
+            let region_text_chars: usize = matched.iter().map(|i| i.text.chars().count()).sum();
+
+            let evaluate = |t: &tables::Table| -> Option<String> {
+                let md = tables::table_to_markdown(t);
+                let trimmed = md.trim();
+                if trimmed.is_empty() {
+                    return None;
                 }
-            } else {
-                page_results.push(RegionText {
+                if is_garbage_text(&md)
+                    || is_cid_garbage(&md)
+                    || detect_encoding_issues(&md)
+                    || looks_like_partial_table_ex(&md, true)
+                {
+                    return None;
+                }
+                // Reject extractions that only captured a small fraction
+                // of the text actually in the region. Two recurring
+                // failure shapes this catches:
+                //   - "header-only": detector found the column-header band
+                //     cleanly but missed every data row below (financial
+                //     statements with multi-line column headers + many
+                //     data rows are the dominant case).
+                //   - "sparse": detector returned a couple of fragmentary
+                //     cells even though the region has many lines of text.
+                // The region floor (200 chars) keeps short legitimate
+                // tables (timestamps, units, axis labels) from being
+                // rejected as partial.
+                if captured_only_a_fragment(&md, region_text_chars) {
+                    return None;
+                }
+                Some(md)
+            };
+
+            let mut accepted_md: Option<String> = None;
+            if !region_rects.is_empty() {
+                let (rect_tables, _) =
+                    tables::detect_tables_from_rects(&matched, &region_rects, page_1idx);
+                accepted_md = rect_tables.iter().find_map(&evaluate);
+            }
+            if accepted_md.is_none() && !region_lines.is_empty() {
+                let line_tables =
+                    tables::detect_tables_from_lines(&matched, &region_lines, page_1idx);
+                accepted_md = line_tables.iter().find_map(&evaluate);
+            }
+            if accepted_md.is_none() {
+                let detected = tables::detect_tables(&matched, base_font_size, false);
+                accepted_md = detected.iter().find_map(&evaluate);
+            }
+
+            match accepted_md {
+                Some(md) => page_results.push(RegionText {
+                    text: md,
+                    needs_ocr: false,
+                }),
+                None => page_results.push(RegionText {
                     text: String::new(),
                     needs_ocr: true,
-                });
+                }),
             }
         }
 
@@ -1294,6 +1354,46 @@ mod vector_grid_tests {
             "expected at least 8 visible body rows; got {}",
             t.rows.len()
         );
+    }
+
+    /// Regression for `wired_header_data_misalign.pdf` — a single page from a
+    /// parts catalog with a 4-column wire-bordered table (`Item | EAN | Nombre
+    /// | Cant`). Column headers are centered/right-aligned inside their cells
+    /// while data is left-aligned, so cluster_x_positions merges or drops
+    /// columns and the cell-rect fallback used to assign text to the wrong
+    /// columns (lost a column, fragmented neighbor cells). The fix prefers
+    /// rect-border-derived column edges when they're well-distributed across
+    /// the actual text items. This test asserts the detector keeps all 4
+    /// columns and every column ends up populated.
+    #[test]
+    fn wired_header_data_misalign_keeps_all_columns() {
+        let tables = detect_rect_tables_in_fixture("tests/fixtures/wired_header_data_misalign.pdf");
+        let table = tables
+            .iter()
+            .find(|t| t.columns.len() == 4 && t.rows.len() >= 5)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a 4-column ≥5-row table; got {:?}",
+                    tables
+                        .iter()
+                        .map(|t| (t.rows.len(), t.columns.len()))
+                        .collect::<Vec<_>>()
+                )
+            });
+        for c in 0..4 {
+            let populated_rows = table
+                .cells
+                .iter()
+                .filter(|row| !row[c].trim().is_empty())
+                .count();
+            assert!(
+                populated_rows >= 2,
+                "column {} only populated in {} rows; cells: {:?}",
+                c,
+                populated_rows,
+                table.cells
+            );
+        }
     }
 
     #[test]
@@ -3554,6 +3654,28 @@ fn is_cid_garbage(text: &str) -> bool {
 /// anymore, only "can we extract it correctly?". Paragraph and duplicate-
 /// header checks stay, since those indicate genuine extraction quality
 /// issues regardless of how the region was identified.
+/// Return true when the captured table markdown represents only a small
+/// fraction of the text the page extractor actually saw inside the
+/// region — typically a header-only band or a sparse fragment where
+/// the detector found valid grid structure but missed most of the
+/// data rows below.
+///
+/// Tuned at a 25% floor: tables that captured at least a quarter of
+/// the region's text are treated as complete-enough. Below 25%, the
+/// caller falls back to `needs_ocr = true` so GLM-OCR can take over.
+/// The 200-char region floor keeps short legitimate tables (units,
+/// axis labels, single-row stat blocks) from being mis-flagged.
+fn captured_only_a_fragment(markdown: &str, region_text_chars: usize) -> bool {
+    if region_text_chars <= 200 {
+        return false;
+    }
+    let captured_text_chars: usize = markdown
+        .chars()
+        .filter(|c| !matches!(c, '|' | '-' | '\n'))
+        .count();
+    captured_text_chars * 4 < region_text_chars
+}
+
 fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
     let lines: Vec<&str> = markdown.lines().filter(|l| l.starts_with('|')).collect();
     if lines.len() < 2 {
@@ -3705,6 +3827,57 @@ fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
 #[cfg(test)]
 fn looks_like_partial_table(markdown: &str) -> bool {
     looks_like_partial_table_ex(markdown, false)
+}
+
+#[cfg(test)]
+mod captured_only_a_fragment_tests {
+    use super::captured_only_a_fragment;
+
+    #[test]
+    fn small_region_skips_check() {
+        // Short legitimate tables (axis labels, unit blocks) shouldn't be
+        // flagged even when the captured markdown is tiny.
+        let md = "|Year|Value|\n|---|---|\n|2024|10|";
+        assert!(!captured_only_a_fragment(md, 50));
+    }
+
+    #[test]
+    fn full_table_passes() {
+        // Captured markdown matches the region text — full extraction.
+        let md =
+            "|Name|Year|Country|\n|---|---|---|\n|Alice|2020|US|\n|Bob|2021|UK|\n|Carol|2019|FR|";
+        // Region had ~50 chars of text (rough estimate of just the data words).
+        assert!(!captured_only_a_fragment(md, 50));
+        // Even a much larger region matched by the markdown content passes.
+        assert!(!captured_only_a_fragment(md, md.len()));
+    }
+
+    #[test]
+    fn header_only_extraction_rejected() {
+        // Captured the column-header band (~30 chars) while the region
+        // actually has many rows of data (~1500 chars).
+        let md = "|Description|Year|Amount|\n|---|---|---|";
+        assert!(captured_only_a_fragment(md, 1500));
+    }
+
+    #[test]
+    fn sparse_fragment_rejected() {
+        // A couple of fragment cells captured from a content-rich region.
+        let md = "|percent|for|\n|---|---|\n|sites|15|";
+        assert!(captured_only_a_fragment(md, 2000));
+    }
+
+    #[test]
+    fn boundary_at_25_percent_floor() {
+        // Right at the 25% line: 250 captured chars of 1000 region chars.
+        // The check rejects when captured*4 < region, so 250*4=1000 is NOT
+        // less than 1000 — boundary is treated as acceptable.
+        let md = "x".repeat(250);
+        assert!(!captured_only_a_fragment(&md, 1000));
+        // Just under 25%: 249*4=996 < 1000 — flagged.
+        let md_under = "x".repeat(249);
+        assert!(captured_only_a_fragment(&md_under, 1000));
+    }
 }
 
 #[cfg(test)]
