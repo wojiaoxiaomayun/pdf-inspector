@@ -92,8 +92,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           # Node 24 ships with npm >= 11, required for OIDC Trusted Publishing.
+          # No registry-url: that creates an .npmrc with a ${NODE_AUTH_TOKEN}
+          # placeholder that conflicts with OIDC; npm publishes to npmjs.org by
+          # default and OIDC handles auth via the GitHub-issued id-token.
           node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
