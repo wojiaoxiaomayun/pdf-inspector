@@ -39,7 +39,7 @@
       "x86_64-pc-windows-msvc"
     ],
     "package": {
-      "name": "@firecrawl/pdf-inspector-js"
+      "name": "@docmost/pdf-inspector-js"
     }
   },
   "scripts": {

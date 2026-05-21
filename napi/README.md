@@ -7,9 +7,9 @@ Built by [Firecrawl](https://firecrawl.dev) for hybrid OCR pipelines — extract
 ## Install
 
 ```bash
-npm install firecrawl-pdf-inspector
+npm install @docmost/pdf-inspector
 # or
-bun add firecrawl-pdf-inspector
+bun add @docmost/pdf-inspector
 ```
 
 Prebuilt binaries included for **linux-x64**, **linux-arm64**, **macOS ARM64**, and **windows-x64**. No Rust toolchain needed.
@@ -21,7 +21,7 @@ Prebuilt binaries included for **linux-x64**, **linux-arm64**, **macOS ARM64**, 
 Full PDF processing — classify, extract text, and convert to Markdown in one call.
 
 ```typescript
-import { processPdf } from 'firecrawl-pdf-inspector'
+import { processPdf } from '@docmost/pdf-inspector'
 import { readFileSync } from 'fs'
 
 const pdf = readFileSync('document.pdf')
@@ -37,7 +37,7 @@ console.log(result.pageCount)  // 42
 Classify a PDF as TextBased, Scanned, Mixed, or ImageBased (~10-50ms). Returns which pages need OCR.
 
 ```typescript
-import { classifyPdf } from 'firecrawl-pdf-inspector'
+import { classifyPdf } from '@docmost/pdf-inspector'
 
 const result = classifyPdf(readFileSync('document.pdf'))
 
@@ -52,7 +52,7 @@ console.log(result.confidence)      // 0.875
 Process a PDF and extract both markdown and images in one call. The markdown contains `![image](pdf-image://N)` placeholders where `N` is the index into the returned `images` array.
 
 ```typescript
-import { processPdfWithImages } from 'firecrawl-pdf-inspector'
+import { processPdfWithImages } from '@docmost/pdf-inspector'
 import { readFileSync } from 'fs'
 
 const result = processPdfWithImages(readFileSync('document.pdf'))
@@ -77,7 +77,7 @@ Extract embedded images from a PDF as raw bytes. Supports JPEG (DCTDecode) and P
 Image extraction is a separate function from text extraction — calling `processPdf` or `extractText` does **not** pay the cost of image decompression/encoding.
 
 ```typescript
-import { extractImages } from 'firecrawl-pdf-inspector'
+import { extractImages } from '@docmost/pdf-inspector'
 import { writeFileSync } from 'fs'
 
 const images = extractImages(readFileSync('document.pdf'))
@@ -96,7 +96,7 @@ Extract text within bounding-box regions from a PDF. Designed for hybrid OCR pip
 Each region result includes a `needsOcr` flag that signals unreliable extraction (empty text, GID-encoded fonts, garbage text, encoding issues).
 
 ```typescript
-import { extractTextInRegions } from 'firecrawl-pdf-inspector'
+import { extractTextInRegions } from '@docmost/pdf-inspector'
 
 const result = extractTextInRegions(pdf, [
   {
@@ -122,7 +122,7 @@ for (const region of result[0].regions) {
 Extract plain text from a PDF.
 
 ```typescript
-import { extractText } from 'firecrawl-pdf-inspector'
+import { extractText } from '@docmost/pdf-inspector'
 
 const text = extractText(readFileSync('document.pdf'))
 ```
