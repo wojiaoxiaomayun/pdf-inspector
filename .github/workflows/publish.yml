@@ -91,12 +91,9 @@ jobs:
     steps:
       - uses: actions/setup-node@v4
         with:
-          # Node 22 ships with npm >= 11, required for OIDC Trusted Publishing.
-          node-version: '22'
+          # Node 24 ships with npm >= 11, required for OIDC Trusted Publishing.
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
-
-      - name: Ensure latest npm (for OIDC support)
-        run: npm install -g npm@latest
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
