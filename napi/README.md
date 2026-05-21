@@ -1,8 +1,14 @@
-# PDF Inspector
+# @docmost/pdf-inspector
 
-Fast PDF classification, text extraction, and image extraction for Node.js/Bun. Native Rust performance via [napi-rs](https://napi.rs).
+Fast PDF classification, text extraction, and **image extraction** for Node.js/Bun. Native Rust performance via [napi-rs](https://napi.rs).
 
-Built by [Firecrawl](https://firecrawl.dev) for hybrid OCR pipelines — extract text from PDF structure where possible, fall back to OCR only when needed.
+This is a fork of [`@firecrawl/pdf-inspector`](https://github.com/firecrawl/pdf-inspector). **This fork adds:**
+
+- `extractImages(buffer)` — extract embedded JPEG/PNG images as raw `Buffer` data with page position
+- `processPdfWithImages(buffer)` — markdown + images in one call, with `pdf-image://N` placeholders matching the `images` array
+- Extra build targets: `linux-arm64-gnu` and `win32-x64-msvc`
+
+> Originally built by [Firecrawl](https://firecrawl.dev) for hybrid OCR pipelines.
 
 ## Install
 
