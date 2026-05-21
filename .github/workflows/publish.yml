@@ -91,8 +91,12 @@ jobs:
     steps:
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # Node 22 ships with npm >= 11, required for OIDC Trusted Publishing.
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
+
+      - name: Ensure latest npm (for OIDC support)
+        run: npm install -g npm@latest
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -107,8 +111,6 @@ jobs:
           echo "=== Package contents ==="
           ls -la publish-pkg/
 
-      - name: Publish to npm
+      - name: Publish to npm (OIDC Trusted Publishing — no token needed)
         working-directory: publish-pkg
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --provenance --access public
