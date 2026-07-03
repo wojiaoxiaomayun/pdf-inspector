@@ -1,6 +1,50 @@
 """Type stubs for pdf_inspector."""
 
+from enum import IntEnum
 from typing import Optional
+
+class ImageFormat(IntEnum):
+    """Image format extracted from PDF."""
+    Jpeg = 0
+    Png = 1
+
+class ExtractedImage:
+    """An image extracted from a PDF."""
+    page: int
+    """Page number (1-indexed)."""
+    x: float
+    """X position on page (PDF points)."""
+    y: float
+    """Y position on page (PDF points)."""
+    width: int
+    """Pixel width."""
+    height: int
+    """Pixel height."""
+    format: ImageFormat
+    """Image format (jpeg or png)."""
+    data: bytes
+    """Raw image bytes (valid JPEG or PNG file)."""
+
+class PdfResultWithImages:
+    """PDF processing result with extracted images.
+
+    The markdown contains ``![image](pdf-image://N)`` placeholders where N
+    is the index into the ``images`` array.
+    """
+    pdf_type: str
+    """'text_based', 'scanned', 'image_based', or 'mixed'."""
+    markdown: Optional[str]
+    page_count: int
+    processing_time_ms: int
+    pages_needing_ocr: list[int]
+    title: Optional[str]
+    confidence: float
+    is_complex_layout: bool
+    pages_with_tables: list[int]
+    pages_with_columns: list[int]
+    has_encoding_issues: bool
+    images: list[ExtractedImage]
+    """Extracted images. Indices match ``pdf-image://N`` placeholders in markdown."""
 
 class PdfResult:
     """Result of processing a PDF file."""
@@ -163,5 +207,41 @@ def extract_pages_markdown_bytes(
     """Extract formatted markdown for pages of a PDF from bytes.
 
     See :func:`extract_pages_markdown` for details.
+    """
+    ...
+
+def extract_images(path: str) -> list[ExtractedImage]:
+    """Extract images from a PDF file.
+
+    Extracts JPEG (DCTDecode) and PNG (FlateDecode) images with position
+    and dimension metadata. Returns raw image bytes as valid JPEG/PNG files.
+    """
+    ...
+
+def extract_images_bytes(data: bytes) -> list[ExtractedImage]:
+    """Extract images from PDF bytes.
+
+    See :func:`extract_images` for details.
+    """
+    ...
+
+def process_pdf_with_images(
+    path: str,
+    pages: Optional[list[int]] = None,
+) -> PdfResultWithImages:
+    """Process a PDF and extract both markdown and images.
+
+    The markdown contains ``![image](pdf-image://N)`` placeholders where N
+    is the index into the returned ``images`` array.
+    """
+    ...
+
+def process_pdf_with_images_bytes(
+    data: bytes,
+    pages: Optional[list[int]] = None,
+) -> PdfResultWithImages:
+    """Process a PDF from bytes and extract both markdown and images.
+
+    See :func:`process_pdf_with_images` for details.
     """
     ...

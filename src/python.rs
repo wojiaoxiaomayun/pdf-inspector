@@ -6,6 +6,7 @@ use std::collections::HashSet;
 
 use crate::detector::PdfType;
 use crate::types::ItemType;
+use crate::types::ImageFormat as RustImageFormat;
 
 // ---------------------------------------------------------------------------
 // Result wrapper
@@ -249,6 +250,119 @@ impl PyTextItem {
 }
 
 // ---------------------------------------------------------------------------
+// Image extraction wrappers
+// ---------------------------------------------------------------------------
+
+/// Image format extracted from PDF.
+#[pyclass(name = "ImageFormat")]
+#[derive(Clone, Debug)]
+pub enum PyImageFormat {
+    /// JPEG (DCTDecode filter).
+    Jpeg = 0,
+    /// PNG (FlateDecode filter).
+    Png = 1,
+}
+
+/// An image extracted from a PDF.
+#[pyclass(name = "ExtractedImage")]
+#[derive(Clone)]
+pub struct PyExtractedImage {
+    /// Page number (1-indexed).
+    #[pyo3(get)]
+    pub page: u32,
+    /// X position on page (PDF points).
+    #[pyo3(get)]
+    pub x: f32,
+    /// Y position on page (PDF points).
+    #[pyo3(get)]
+    pub y: f32,
+    /// Pixel width.
+    #[pyo3(get)]
+    pub width: u32,
+    /// Pixel height.
+    #[pyo3(get)]
+    pub height: u32,
+    /// Image format (jpeg or png).
+    #[pyo3(get)]
+    pub format: PyImageFormat,
+    /// Raw image bytes (valid JPEG or PNG file).
+    #[pyo3(get)]
+    pub data: Vec<u8>,
+}
+
+#[pymethods]
+impl PyExtractedImage {
+    fn __repr__(&self) -> String {
+        let fmt = match self.format {
+            PyImageFormat::Jpeg => "jpeg",
+            PyImageFormat::Png => "png",
+        };
+        format!(
+            "ExtractedImage(page={}, {}x{}, format='{}', {}bytes)",
+            self.page,
+            self.width,
+            self.height,
+            fmt,
+            self.data.len()
+        )
+    }
+}
+
+/// PDF processing result with extracted images.
+#[pyclass(name = "PdfResultWithImages")]
+#[derive(Clone)]
+pub struct PyPdfResultWithImages {
+    /// The detected PDF type: "text_based", "scanned", "image_based", or "mixed".
+    #[pyo3(get)]
+    pub pdf_type: String,
+    /// Markdown output with `![image](pdf-image://N)` placeholders.
+    #[pyo3(get)]
+    pub markdown: Option<String>,
+    /// Total number of pages.
+    #[pyo3(get)]
+    pub page_count: u32,
+    /// Processing time in milliseconds.
+    #[pyo3(get)]
+    pub processing_time_ms: u64,
+    /// 1-indexed page numbers that need OCR.
+    #[pyo3(get)]
+    pub pages_needing_ocr: Vec<u32>,
+    /// Title from PDF metadata.
+    #[pyo3(get)]
+    pub title: Option<String>,
+    /// Detection confidence (0.0-1.0).
+    #[pyo3(get)]
+    pub confidence: f32,
+    /// Whether the layout is complex (tables/columns detected).
+    #[pyo3(get)]
+    pub is_complex_layout: bool,
+    /// Pages with tables detected.
+    #[pyo3(get)]
+    pub pages_with_tables: Vec<u32>,
+    /// Pages with multi-column layout.
+    #[pyo3(get)]
+    pub pages_with_columns: Vec<u32>,
+    /// Whether encoding issues were detected.
+    #[pyo3(get)]
+    pub has_encoding_issues: bool,
+    /// Extracted images. Indices match `pdf-image://N` placeholders in markdown.
+    #[pyo3(get)]
+    pub images: Vec<PyExtractedImage>,
+}
+
+#[pymethods]
+impl PyPdfResultWithImages {
+    fn __repr__(&self) -> String {
+        format!(
+            "PdfResultWithImages(pdf_type='{}', pages={}, images={})",
+            self.pdf_type,
+            self.page_count,
+            self.images.len()
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -374,6 +488,45 @@ fn convert_region_results(results: Vec<crate::PageRegionResult>) -> Vec<PyPageRe
                 .collect(),
         })
         .collect()
+}
+
+fn convert_image_format(f: &RustImageFormat) -> PyImageFormat {
+    match f {
+        RustImageFormat::Jpeg => PyImageFormat::Jpeg,
+        RustImageFormat::Png => PyImageFormat::Png,
+    }
+}
+
+fn convert_extracted_images(images: Vec<crate::ExtractedImage>) -> Vec<PyExtractedImage> {
+    images
+        .into_iter()
+        .map(|img| PyExtractedImage {
+            page: img.page,
+            x: img.x,
+            y: img.y,
+            width: img.width,
+            height: img.height,
+            format: convert_image_format(&img.format),
+            data: img.data,
+        })
+        .collect()
+}
+
+fn to_py_result_with_images(r: crate::PdfProcessResult) -> PyPdfResultWithImages {
+    PyPdfResultWithImages {
+        pdf_type: pdf_type_str(r.pdf_type),
+        markdown: r.markdown,
+        page_count: r.page_count,
+        processing_time_ms: r.processing_time_ms,
+        pages_needing_ocr: r.pages_needing_ocr,
+        title: r.title,
+        confidence: r.confidence,
+        is_complex_layout: r.layout.is_complex,
+        pages_with_tables: r.layout.pages_with_tables,
+        pages_with_columns: r.layout.pages_with_columns,
+        has_encoding_issues: r.has_encoding_issues,
+        images: convert_extracted_images(r.images),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -559,16 +712,70 @@ fn extract_pages_markdown_bytes(
     Ok(to_py_pages_result(result))
 }
 
+/// Extract images from a PDF file.
+///
+/// Extracts JPEG (DCTDecode) and PNG (FlateDecode) images with position
+/// and dimension metadata. Returns raw image bytes as valid JPEG/PNG files.
+#[pyfunction]
+fn extract_images(path: &str) -> PyResult<Vec<PyExtractedImage>> {
+    let data = std::fs::read(path).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    extract_images_bytes(&data)
+}
+
+/// Extract images from PDF bytes.
+///
+/// See [`extract_images`] for details.
+#[pyfunction]
+fn extract_images_bytes(data: &[u8]) -> PyResult<Vec<PyExtractedImage>> {
+    let images = crate::extract_images_mem(data).map_err(to_py_err)?;
+    Ok(convert_extracted_images(images))
+}
+
+/// Process a PDF and extract both markdown and images.
+///
+/// The markdown contains `![image](pdf-image://N)` placeholders where N
+/// is the index into the returned `images` array.
+#[pyfunction]
+#[pyo3(signature = (path, pages=None))]
+fn process_pdf_with_images(path: &str, pages: Option<Vec<u32>>) -> PyResult<PyPdfResultWithImages> {
+    let mut opts = crate::PdfOptions::new().extract_images(true);
+    if let Some(p) = pages {
+        opts = opts.pages(p);
+    }
+    let result = crate::process_pdf_with_options(path, opts).map_err(to_py_err)?;
+    Ok(to_py_result_with_images(result))
+}
+
+/// Process a PDF from bytes and extract both markdown and images.
+///
+/// See [`process_pdf_with_images`] for details.
+#[pyfunction]
+#[pyo3(signature = (data, pages=None))]
+fn process_pdf_with_images_bytes(
+    data: &[u8],
+    pages: Option<Vec<u32>>,
+) -> PyResult<PyPdfResultWithImages> {
+    let mut opts = crate::PdfOptions::new().extract_images(true);
+    if let Some(p) = pages {
+        opts = opts.pages(p);
+    }
+    let result = crate::process_pdf_mem_with_options(data, opts).map_err(to_py_err)?;
+    Ok(to_py_result_with_images(result))
+}
+
 /// Python module definition.
 #[pymodule]
 fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPdfResult>()?;
+    m.add_class::<PyPdfResultWithImages>()?;
     m.add_class::<PyPdfClassification>()?;
     m.add_class::<PyTextItem>()?;
     m.add_class::<PyRegionText>()?;
     m.add_class::<PyPageRegionTexts>()?;
     m.add_class::<PyPageMarkdown>()?;
     m.add_class::<PyPagesExtractionResult>()?;
+    m.add_class::<PyExtractedImage>()?;
+    m.add_class::<PyImageFormat>()?;
     m.add_function(wrap_pyfunction!(process_pdf, m)?)?;
     m.add_function(wrap_pyfunction!(process_pdf_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(detect_pdf, m)?)?;
@@ -583,5 +790,9 @@ fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_text_in_regions_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_pages_markdown, m)?)?;
     m.add_function(wrap_pyfunction!(extract_pages_markdown_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_images, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_images_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(process_pdf_with_images, m)?)?;
+    m.add_function(wrap_pyfunction!(process_pdf_with_images_bytes, m)?)?;
     Ok(())
 }
